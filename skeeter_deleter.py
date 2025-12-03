@@ -60,7 +60,7 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
         """
         return hasattr(self.embed, "external") and \
             any([uri in self.embed.external.uri for uri in domains_to_protect])
-        
+
     def is_self_liked(self, self_likes) -> bool:
         """
         Check if the author of the post has liked it.
@@ -72,12 +72,15 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
             bool: True if the author has liked the post, False otherwise.
         """
         return self.uri in [post['subject']['uri'] for post in self_likes]
-    
-    def __init__(self, client : Client):
+
+    def is_reply(self, post) -> bool:
+        return post.record.reply is not None
+
+    def __init__(self, client: Client):
         super(PostQualifier, self).__init__()
         self._init_PostQualifier(client)
-    
-    def _init_PostQualifier(self, client : Client):
+
+    def _init_PostQualifier(self, client: Client):
         self.client = client
 
     def delete_like(self):
@@ -121,7 +124,7 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
                 logging.error(f"An error occurred during deletion: {e}")
 
     @staticmethod
-    def to_delete(viral_threshold, stale_threshold, domains_to_protect, now, self_likes, post):
+    def to_delete(viral_threshold, stale_threshold, replies_only, domains_to_protect, now, self_likes, post):
         """
         Determine if a post should be deleted.
         Args:
@@ -136,8 +139,9 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
             bool: True if the post should be deleted, False otherwise.
         """
         if (post.is_viral(viral_threshold) or post.is_stale(stale_threshold, now)) and \
-            not post.is_protected_domain(domains_to_protect) and \
-            not post.is_self_liked(self_likes):
+                (replies_only and post.is_reply(post)) and \
+                not post.is_protected_domain(domains_to_protect) and \
+                not post.is_self_liked(self_likes):
             return True
         return False
 
@@ -153,9 +157,9 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
             bool: True if the post should be unliked, False otherwise.
         """
         return post.is_stale(stale_threshold, now)
-    
+
     @staticmethod
-    def cast(client : Client, post : models.AppBskyFeedDefs.PostView):
+    def cast(client: Client, post: models.AppBskyFeedDefs.PostView):
         """
         Cast a post to a PostQualifier instance.
         Args:
@@ -167,7 +171,7 @@ class PostQualifier(models.AppBskyFeedDefs.PostView):
         post.__class__ = PostQualifier
         post._init_PostQualifier(client)
         return post
-    
+
 @dataclass
 class Credentials:
     login: str
@@ -184,7 +188,7 @@ class RequestCustomTimeout(Request):
 
 class SkeeterDeleter:
     @staticmethod
-    def chunker(seq, size : int):
+    def chunker(seq, size: int):
         """
         Break a iterable into segments of a given size
 
@@ -195,7 +199,7 @@ class SkeeterDeleter:
             list[iterable]: List of iterables of length at most size
         """
         return (seq[pos:pos + size] for pos in range(0, len(seq), size))
-    
+
     @staticmethod
     def extract_feed_item(archive, block):
         """
@@ -223,17 +227,17 @@ class SkeeterDeleter:
         likes = list(map(partial(self.extract_feed_item, archive),
                          filter(lambda x: 'app.bsky.feed.like' in str(x),
                                 [archive.blocks.get(cid) for cid in archive.blocks])))
-        
+
         self_likes = list(filter(lambda x: archive.blocks.get(x['subject']['cid']),
-                                 filter(lambda x : self.client.me.did in x['subject']['uri'], likes)))
-        other_likes = list(filter(lambda x : self.client.me.did not in x['subject']['uri'], likes))
-        
+                                 filter(lambda x: self.client.me.did in x['subject']['uri'], likes)))
+        other_likes = list(filter(lambda x: self.client.me.did not in x['subject']['uri'], likes))
+
         # The API limits the get_posts method to 25 results at a time. 
         to_unlike = []
         for batch in self.chunker(other_likes, 25):
             try:
                 posts_to_unlike = self.client.get_posts(uris=[x['subject']['uri']
-                                                            for x in batch])
+                                                              for x in batch])
                 to_unlike.extend(
                     list(filter(
                         partial(PostQualifier.to_remove, stale_threshold, now),
@@ -257,18 +261,18 @@ class SkeeterDeleter:
                        self_likes,
                        **kwargs) -> list[PostQualifier]:
         archive = CAR.from_bytes(repo)
-        
+
         reposts = list(
-            filter(lambda x : '$type' in x and
-                   "app.bsky.feed.repost" in str(x),
+            filter(lambda x: '$type' in x and
+                             "app.bsky.feed.repost" in str(x),
                    [archive.blocks.get(cid) for cid in archive.blocks]
-            )
+                   )
         )
         to_unrepost = []
         for batch in self.chunker(reposts, 25):
             try:
                 posts_to_remove = self.client.get_posts(uris=[x['subject']['uri']
-                                                            for x in batch])
+                                                              for x in batch])
                 to_unrepost.extend(
                     list(filter(
                         partial(PostQualifier.to_delete,
@@ -290,6 +294,7 @@ class SkeeterDeleter:
     def gather_posts_to_delete(self,
                                viral_threshold,
                                stale_threshold,
+                               replies_only,
                                domains_to_protect,
                                now,
                                self_likes,
@@ -303,16 +308,17 @@ class SkeeterDeleter:
                                                     filter="from:me",
                                                     limit=100)
                 delete_test = partial(PostQualifier.to_delete,
-                                    viral_threshold,
-                                    stale_threshold,
-                                    domains_to_protect,
-                                    now,
-                                    self_likes)
+                                      viral_threshold,
+                                      stale_threshold,
+                                      replies_only,
+                                      domains_to_protect,
+                                      now,
+                                      self_likes)
                 to_delete.extend(list(filter(
                     delete_test,
                     map(partial(PostQualifier.cast, self.client),
                         [x.post for x in posts.feed]
-                    )
+                        )
                 )))
 
                 cursor = posts.cursor
@@ -345,13 +351,13 @@ class SkeeterDeleter:
             if self.verbosity == 2:
                 print(f"Deleting: {post.record.text} on {post.record.created_at}, CID: {post.cid}")
             post.remove()
-            
+
     def archive_repo(self, now, **kwargs):
         repo = self.client.com.atproto.sync.get_repo(params={'did': self.client.me.did})
         clean_user_did = self.client.me.did.replace(":", "_")
         Path(f"archive/{clean_user_did}/_blob/").mkdir(parents=True, exist_ok=True)
         print("Archiving posts...")
-        clean_now = now.isoformat().replace(':','_')
+        clean_now = now.isoformat().replace(':', '_')
         with open(f"archive/{clean_user_did}/bsky-archive-{clean_now}.car", "wb") as f:
             f.write(repo)
 
@@ -376,13 +382,14 @@ class SkeeterDeleter:
         return repo
 
     def __init__(self,
-                 credentials : Credentials,
-                 viral_threshold : int=0,
-                 stale_threshold : int=0,
-                 domains_to_protect : list[str]=[],
-                 fixed_likes_cursor : str=None,
-                 verbosity : int=0,
-                 autodelete : bool=False):
+                 credentials: Credentials,
+                 viral_threshold: int = 0,
+                 stale_threshold: int = 0,
+                 replies_only: bool = False,
+                 domains_to_protect: list[str] = [],
+                 fixed_likes_cursor: str = None,
+                 verbosity: int = 0,
+                 autodelete: bool = False):
         self.client = Client(request=RequestCustomTimeout())
         self.client.login(**credentials.dict())
 
@@ -390,6 +397,7 @@ class SkeeterDeleter:
         params = {
             'viral_threshold': viral_threshold,
             'stale_threshold': stale_threshold,
+            'replies_only': replies_only,
             'domains_to_protect': domains_to_protect,
             'fixed_likes_cursor': fixed_likes_cursor,
             'now': datetime.now(timezone.utc),
@@ -401,7 +409,7 @@ class SkeeterDeleter:
 
         self_likes, self.to_unlike = self.gather_likes(repo, **params)
         print(f"Found {len(self.to_unlike)} post{'' if len(self.to_unlike) == 1 else 's'} to unlike.")
-        
+
         to_unrepost = self.gather_reposts(repo, self_likes=self_likes, **params)
         print(f"Found {len(to_unrepost)} post{'' if len(to_unrepost) == 1 else 's'} to unrepost.")
 
@@ -409,7 +417,6 @@ class SkeeterDeleter:
         print(f"Found {len(self.to_delete)} post{'' if len(self.to_delete) == 1 else 's'} to delete.")
 
         self.to_delete.extend(to_unrepost)
-
 
     def unlike(self):
         n_unlike = len(self.to_unlike)
@@ -438,19 +445,21 @@ Defaults to 0.""", default=0, type=int)
     parser.add_argument("-s", "--stale-limit", help="""The upper bound of the age of a post in days before it is deleted.
 Ignore or set to 0 to not set an upper limit. This feature deletes old posts that may be taken out of context or selectively
 misinterpreted, reducing potential harassment. Defaults to 0.""", default=0, type=int)
+    parser.add_argument("-r", "--replies-only", help="""Delete only if the post is a reply""", default=False)
     parser.add_argument("-d", "--domains-to-protect", help="""A comma separated list of domain names to protect. Posts linking to
 domains in this list will not be auto-deleted regardless of age or virality. Default is empty.""", default="")
     parser.add_argument("-c", "--fixed-likes-cursor", help="""A complex setting. ATProto pagination through is awkward, and
 it will page through the entire history of your account even if there are no likes to be found. This can make the process take
 a long time to complete. If you have already purged likes, it's possible to simply set a token at a reasonable point in the recent
 past which will terminate the search. To list the tokens, run -vv mode. Tokens are short alphanumeric strings. Default empty.""",
-default="")
+                        default="")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", help="""Show more information about what is happening.""",
                            action="store_true")
     verbosity.add_argument("-vv", "--very-verbose", help="""Show granular information about what is happening.""",
                            action="store_true")
-    parser.add_argument("-y", "--yes", help="""Ignore warning prompts for deletion. Necessary for running in automation.""",
+    parser.add_argument("-y", "--yes",
+                        help="""Ignore warning prompts for deletion. Necessary for running in automation.""",
                         action="store_true", default=False)
     args = parser.parse_args()
 
@@ -464,8 +473,9 @@ default="")
     params = {
         'viral_threshold': max([0, args.max_reposts]),
         'stale_threshold': max([0, args.stale_limit]),
+        'replies_only': args.replies_only,
         'domains_to_protect': ([] if args.domains_to_protect == ""
-                               else [s.strip() 
+                               else [s.strip()
                                      for s in args.domains_to_protect.split(",")]),
         'fixed_likes_cursor': args.fixed_likes_cursor,
         'verbosity': verbosity,
